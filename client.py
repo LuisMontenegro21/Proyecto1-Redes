@@ -1,5 +1,4 @@
 #
-#
 # Reference: https://modelcontextprotocol.io/quickstart/client 
 
 import asyncio
@@ -10,7 +9,7 @@ from mcp.client.stdio import stdio_client
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv() # load environmental variables
 
 class Client:
 
@@ -37,17 +36,84 @@ class Client:
         self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
         await self.session.initialize()
         
-        response = await self.session.list_tools()
+        response = await self.session.list_tools() # gather tools to further get what the Agent needs from the API
         tools = response.tools
         print("\nConnected to server with tools:", [tool.name for tool in tools])
 
 
     
-    async def process_query(self, query:str):
-        pass
+    async def process_query(self, query:str) -> str:
+        messages = [
+            {
+                "role":"user",
+                "content":"query"
+            }
+        ]
+        response = await self.session.list_tools()
+        available_tools = [{
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.inputSchema
+        } for tool in response.tools]
 
-    async def chat(self):
-        pass
+        # Initiate API call to Agent 
 
-    async def cleanup(self):
-        pass
+        # list agent tools 
+        final_text = []
+
+        assistant_message_content = []
+        for content in response.content:
+            if content.type == 'text':
+                final_text.append(content.text)
+                assistant_message_content.append(content)
+            elif content.type == 'tool_use':
+                tool_name = content.name
+                tool_args = content.input
+                # make tool call
+                result = await self.session.call_tool(tool_name, tool_args)
+                final_text.append(f"[Calling tool {tool_name} with args {tool_args}]")
+
+                assistant_message_content.append(content)
+                messages.append({
+                    "role": "assistant",
+                    "content": assistant_message_content
+                })
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": content.id,
+                            "content": result.content
+                        }
+                    ]
+                })
+
+                # gather Agent API call
+
+                # final_text.append(api_response[0])
+
+        return "\n".join(final_text) # return a string
+                
+
+    async def chat(self) -> None:
+        '''
+        Provides chat interface to generate questions and responses
+        '''
+        while True:
+            try:
+                query = input("\nAsk something: ").strip()
+                # exit command
+                if query.lower() == "exit":
+                    break
+
+                response = await self.process_query(query=query)
+                print("\n" + response)
+
+            except Exception as exc:
+                print(f"\nError: {exc}")
+            except KeyboardInterrupt:
+                print(f"Session ended by keyboard interruption")
+
+    async def cleanup(self) -> None:
+        await self.exit_stack.aclose()
