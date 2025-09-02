@@ -38,7 +38,7 @@ class Client:
         
         response = await self.session.list_tools() # gather tools to further get what the Agent needs from the API
         tools = response.tools
-        print("\nConnected to server with tools:", [tool.name for tool in tools])
+        print("\nConnected to server with tools:", [tool.name for tool in tools]) # display tools to user
 
 
     
@@ -117,3 +117,7 @@ class Client:
 
     async def cleanup(self) -> None:
         await self.exit_stack.aclose()
+
+
+
+
