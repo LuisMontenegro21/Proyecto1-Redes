@@ -6,7 +6,7 @@ from contextlib import AsyncExitStack
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from anthropic import Anthropic
+# from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv() # load environmental variables
@@ -16,7 +16,7 @@ class Client:
     def __init__(self) -> None:
         self.session: ClientSession | None = None
         self.exit_stack = AsyncExitStack()
-        self.anthropic = Anthropic()
+        # self.anthropic = Anthropic()
 
 
     async def connect_to_server(self, server_path:str):
