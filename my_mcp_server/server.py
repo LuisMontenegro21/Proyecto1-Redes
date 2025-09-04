@@ -47,7 +47,8 @@ async def get_satellite_data(query: str) -> str:
 
 @mcp.tool()
 async def get_satellite(query: str) -> str:
-    pass
+    url = f"{API_BASE}/tle/"
+    data = await make_request(url=url, params=)
 
 
 async def make_request(url: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any] | None:
@@ -101,7 +102,8 @@ async def format_information(member: dict) -> list[str]:
         f"line2      : {line2}"
     )
 
-if __name__ == '__main__':
+
+def main():
     logging.info("Starting up server")
     try: 
         mcp.run(
@@ -109,3 +111,6 @@ if __name__ == '__main__':
         )
     except KeyboardInterrupt:
         logging.info("Stopped server : KeyboardInterrupt")
+
+if __name__ == '__main__':
+    main()

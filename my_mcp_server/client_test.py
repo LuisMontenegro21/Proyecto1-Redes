@@ -29,5 +29,10 @@ async def main():
         finally:
             await session.__aexit__(None, None, None)
 
+
+
+
+
+
 if __name__ == "__main__":
     asyncio.run(main())
