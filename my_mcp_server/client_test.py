@@ -24,7 +24,7 @@ async def main():
             # 2) Call a tool (use one of your real tool names and args)
             # Prefer the convenience method:
             if tool_names:
-                result = await session.call_tool("get_satellite_data", {"query": "35932"})
+                result = await session.call_tool(tool_names[0], {"query": "35932"})
                 print("Tool result:", result.content)
         finally:
             await session.__aexit__(None, None, None)

@@ -5,8 +5,6 @@ from mcp.server.fastmcp import FastMCP
 import json
 import sys
 import asyncio
-# from starlette.middleware.cors import CORSMiddleware
-# from starlette.middleware import Middleware
 import logging
 
 API_BASE = "https://tle.ivanstanojevic.me/api" # API URL
@@ -19,18 +17,17 @@ logging.basicConfig(
     stream=sys.stderr,
 )
 
+# for some reason it only works with this
 DEFAULT_HEADERS = {
     "Accept": "application/json",
-    # Some endpoints close on unknown/empty UA; send a boring browsery UA:
     "User-Agent": "Mozilla/5.0 (compatible; mcp-client/1.0; +https://example.com)",
-    # Nudge some servers to avoid keep-alive weirdness
     "Connection": "close",
 }
 
 @mcp.tool()
 async def get_satellite_data(query: str) -> str:    
     '''
-    Gets information of a specific statellite
+    Searches information from a satellite
     '''
     url = f"{API_BASE}/tle/"  
 
@@ -46,13 +43,21 @@ async def get_satellite_data(query: str) -> str:
     return "\n\n".join(data)
 
 @mcp.tool()
-async def get_satellite(query: str) -> str:
-    url = f"{API_BASE}/tle/"
-    data = await make_request(url=url, params=)
-
+async def get_satellite_by_id(query: str) -> str:
+    '''
+    Gets information from a satellite using the ID
+    '''
+    url = f"{API_BASE}/tle/{query}"
+    data = await make_request(url=url)
+    if  not isinstance(data, dict):
+        return f"Fetching failed for '{query}'"
+    data = await asyncio.gather(format_information(data))
+    return "\n\n".join(data)
 
 async def make_request(url: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any] | None:
-
+    '''
+    Helper function to make requests to the API
+    '''
     async with httpx.AsyncClient(                    
         timeout=httpx.Timeout(25.0),
         headers=DEFAULT_HEADERS,
