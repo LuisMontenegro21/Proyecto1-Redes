@@ -1,13 +1,11 @@
-# client_test.py
+from mcp.client.session import ClientSession
+from mcp.client.stdio import stdio_client, StdioServerParameters
 import asyncio
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
 
 async def main():
-    # Point this at your server; use absolute path if you prefer
     server = StdioServerParameters(
-        command="uv",          # or "uv"
-        args=["run", "python", "server.py"],        # if using uv: command="uv", 
+        command="C:\\Users\\lpmon\\Documents\\Github\\Proyecto1-Redes\\my_mcp_server\\.venv\\Scripts\\my-mcp-server.exe",
+        args=[],  
         env=None
     )
 
@@ -21,18 +19,24 @@ async def main():
             tool_names = [t.name for t in tools_resp.tools]
             print("Tools:", tool_names)
 
-            # 2) Call a tool (use one of your real tool names and args)
-            # Prefer the convenience method:
-            if tool_names:
-                result = await session.call_tool(tool_names[0], {"query": "35932"})
+            # 2) Call list_hazards
+            if "list_hazards" in tool_names:
+                result = await session.call_tool("list_hazards", {
+                    "input": {
+                        "lat": 14.6,
+                        "lon": -90.5,
+                        "start_date": "2025-06-01",
+                        "end_date": "2025-09-16",
+                        "radius_km": 1500
+                        # categories omitted on purpose
+                    }
+                })
                 print("Tool result:", result.content)
+            else:
+                print("list_hazards tool not found!")
+
         finally:
             await session.__aexit__(None, None, None)
-
-
-
-
-
 
 if __name__ == "__main__":
     asyncio.run(main())

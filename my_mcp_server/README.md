@@ -13,7 +13,7 @@ Then restart the terminal and check if it was correctly installed.<br>
 
 ### Install
 Go to your terminal and run<br>
-`cd my_mcop_server`
+`cd my_mcp_server`
 `uv pip install -e .`
 
 ### How to run the server on Claude Desktop
@@ -26,7 +26,7 @@ where my-mcp-server.exe is located. Place absolute path.
 {
   "mcpServers": {
     "satellite": {
-      "command": "<ABSOLUTE_PATH_TO>my_mcp_server\\.venv\\Scripts\\my-mcp-server.exe",
+      "command": "<ABSOLUTE_PATH_TO>\\my_mcp_server\\.venv\\Scripts\\my-mcp-server.exe",
       "args": [],
       "transport": "stdio"
     }

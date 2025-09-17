@@ -14,6 +14,7 @@ from pydantic import BaseModel
 SATELLITE_API = "https://tle.ivanstanojevic.me/api"
 EONET_API = "https://eonet.gsfc.nasa.gov/api/v3/events"
 DONKI_API = "https://api.nasa.gov/DONKI/alerts"
+SOLAR_API = "https://power.larc.nasa.gov/api/temporal/daily/point"
 NASA_KEY = "DEMO"
 mcp = FastMCP(name="MyMCPServer")
 
@@ -31,6 +32,9 @@ DEFAULT_HEADERS = {
     "Connection": "close",
 }
 
+class Satellite(BaseModel):
+    id: str
+    name: str
 
 
 class Hazards(BaseModel):
@@ -55,81 +59,185 @@ def haversine_km(a: tuple, b: tuple) -> float:
     s = (math.sin(dlat/2)**2 + math.cos(math.radians(a[0]))*math.cos(math.radians(b[0]))*math.sin(dlon/2)**2)
     return 2*R*math.asin(math.sqrt(s))
 
+
+def _safe_list(val):
+    return val if isinstance(val, list) else []
+
+def _safe_val(obj, key, default=None):
+
+    if isinstance(obj, dict):
+        val = obj.get(key, default)
+        return default if val is None else val
+    return default
+
 @mcp.tool()
-async def get_hazards(input: Hazards) -> dict:
-    eonet = await make_request(EONET_API, params={"status":"all", "start":input.start_date, "end":input.end_date})
+async def list_hazards(input: Hazards) -> dict:
+    """List natural hazards near a location (EONET + DONKI)."""
+    logging.info("Using tool list_hazards")
     events = []
-    for ev in eonet.get("events",[]):
-        if input.categories and ev.get("categories"):
-            cats = {c["title"].lower() for c in ev["categories"]}
-            if not any(c in cats for c in [c.lower() for c in input.categories]):
+
+    # ----- EONET -----
+    eonet = await make_request(
+        EONET_API,
+        params={"status": "all", "start": input.start_date, "end": input.end_date}
+    )
+    eonet_events = _safe_list(_safe_val(eonet, "events", []))
+
+    cats_filter = {c.lower() for c in (input.categories or [])} or None
+
+    for ev in eonet_events:
+        ev_categories = _safe_list(_safe_val(ev, "categories", []))
+        ev_cat_titles = {(_safe_val(c, "title", "") or "").lower() for c in ev_categories if isinstance(c, dict)}
+        if cats_filter and not (ev_cat_titles & cats_filter):
+            continue
+
+        nearest, ndist = None, None
+        for g in _safe_list(_safe_val(ev, "geometry", [])):
+            if _safe_val(g, "type", None) != "Point":
+                continue
+            coords = _safe_list(_safe_val(g, "coordinates", []))
+            if len(coords) < 2:
+                continue
+            lon, lat = coords[0], coords[1]
+            if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
                 continue
 
-        nearest=None; ndist=None
-        for g in ev.get("geometry", []):
-            if g.get("type")=="Point":
-                lat,lon = g["coordinates"][1], g["coordinates"][0]
-                d = haversine_km((input.lat,input.lon),(lat,lon))
-                if ndist is None or d<ndist: 
-                    ndist, nearest = d, (lat,lon,g.get("date"))
-        if ndist is not None and ndist <= input.radius_km:
+            d = haversine_km((input.lat, input.lon), (lat, lon))
+            if ndist is None or d < ndist:
+                ndist, nearest = d, (lat, lon, _safe_val(g, "date", None))
+
+        if ndist is not None and ndist <= getattr(input, "radius_km", 250):
+            href = None
+            links = _safe_list(_safe_val(ev, "links", []))
+            if links and isinstance(links[0], dict):
+                href = _safe_val(links[0], "href", None)
+
             events.append({
-                "source":"EONET",
-                "title":ev.get("title"),
-                "category":[c["title"] for c in ev.get("categories",[])],
-                "distance_km":round(ndist,1),
-                "when":nearest[2],
-                "lat":nearest[0],"lon":nearest[1],
-                "id":ev.get("id"),
-                "link":ev.get("links",[{}])[0].get("href")
+                "source": "EONET",
+                "title": _safe_val(ev, "title", None),
+                "category": [_safe_val(c, "title", None) for c in ev_categories if isinstance(c, dict)],
+                "distance_km": round(ndist, 1),
+                "when": nearest[2] if nearest else None,
+                "lat": nearest[0] if nearest else None,
+                "lon": nearest[1] if nearest else None,
+                "id": _safe_val(ev, "id", None),
+                "link": href
             })
-        donki = await make_request(DONKI_API, params={"startDate":input.start_date,"endDate":input.end_date,"api_key":NASA_KEY})
-        for al in donki:
+
+    donki = await make_request(
+        DONKI_API,
+        params={"startDate": input.start_date, "endDate": input.end_date, "api_key": NASA_KEY}
+    )
+
+    if isinstance(donki, dict) and "error" in donki:
+
+        events.append({
+            "source": "DONKI",
+            "title": "DONKI error",
+            "category": ["Space Weather"],
+            "distance_km": None,
+            "when": None,
+            "lat": None, "lon": None,
+            "id": None,
+            "link": None,
+            "note": _safe_val(_safe_val(donki, "error", {}), "message", "Unknown DONKI error")
+        })
+    else:
+        for al in _safe_list(donki):
             events.append({
-                "source":"DONKI",
-                "title":al.get("messageType","Alert"),
-                "category":["Space Weather"],
+                "source": "DONKI",
+                "title": _safe_val(al, "messageType", "Alert"),
+                "category": ["Space Weather"],
                 "distance_km": None,
-                "when": al.get("messageIssueTime"),
+                "when": _safe_val(al, "messageIssueTime", None),
                 "lat": None, "lon": None,
-                "id": al.get("alertId"),
-                "link": al.get("link")
+                "id": _safe_val(al, "alertId", None),
+                "link": _safe_val(al, "link", None)
             })
-    logging.info("Using tool get_hazards")
+
     return {"events": events}
 
 
+
+
+async def solar_weather(input: SolarWindow):
+    """Rank dates by solar potential and low precip; exclude severe space weather."""
+
+    params = {
+        "parameters":"ALLSKY_SFC_SW_DWN,PRECTOTCORR",
+        "community":"RE",
+        "longitude":input.lon,
+        "latitude":input.lat,
+        "start":input.start_date.replace("-",""),
+        "end":input.end_date.replace("-",""),
+        "format":"JSON"
+    }
+    power = await make_request(SOLAR_API, params)
+    d = power["properties"]["parameter"]
+    sw = d.get("ALLSKY_SFC_SW_DWN",{})
+    pr = d.get("PRECTOTCORR",{})
+
+
+    alerts = await make_request(
+        DONKI_API,
+        params={"startDate":input.start_date,"endDate":input.end_date,"api_key":NASA_KEY}
+    )
+    alert_days = {a["messageIssueTime"][:10] for a in alerts if "messageIssueTime" in a}
+
+    def _score(day):
+        ssw = float(sw.get(day, 0.0))        
+        p = float(pr.get(day, 0.0))           
+        penalty = 0.0
+        if day in alert_days: 
+            penalty += 0.3  
+        penalty += min(p/20.0, 1.0)           
+        raw = (ssw / 8.0)                     
+        return max(raw - penalty, -1.0)
+
+    rows=[]
+    for day in sorted(set(sw.keys())|set(pr.keys())):
+        rows.append({
+            "date": day,
+            "solar_irradiance": sw.get(day),
+            "precip": pr.get(day),
+            "space_weather_ok": day not in alert_days,
+            "score": round(_score(day), 3)
+        })
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return {"windows": rows[:7], "all": rows}
+
+
+
 @mcp.tool()
-async def get_satellite_data(query: str) -> str:    
+async def search_satellites(input: Satellite) -> dict:    
     '''
     Searches information from a satellite
     '''
     url = f"{SATELLITE_API}/tle/"  
 
-    data = await make_request(url=url, params={"search": query})
-    if  not isinstance(data, dict):
-        return f"Fetching failed for '{query}'"
+    data = await make_request(url=url, params={"search": input.name})
+    if not isinstance(data, dict):
+        return {}
     
     members = data.get("member", [])
     if not members:
         return f"No members found"
     
     data = await asyncio.gather(*[format_information(m) for m in members])
-    logging.info("Using tool get_satellite_data")
-    return "\n\n".join(data)
+    return data
 
 @mcp.tool()
-async def get_satellite_by_id(query: str) -> str:
+async def search_satellite_by_id(input: Satellite) -> dict:
     '''
     Gets information from a satellite using the ID
     '''
-    url = f"{SATELLITE_API}/tle/{query}"
+    url = f"{SATELLITE_API}/tle/{input.id}"
     data = await make_request(url=url)
     if  not isinstance(data, dict):
-        return f"Fetching failed for '{query}'"
+        return {}
     data = await asyncio.gather(format_information(data))
-    logging.info("Using tool get_satellite_by_id")
-    return "\n\n".join(data)
+    logging.info("Using tool search_satellite_by_id")
+    return data
 
 async def make_request(url: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any] | None:
     '''
