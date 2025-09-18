@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.sse import sse_client, SseServerParameters
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
@@ -19,7 +20,7 @@ class Client:
         self.anthropic = Anthropic()
 
 
-    async def connect_to_server(self, server_path:str):
+    async def connect_to_local_server(self, server_path:str):
         is_python: bool = server_path.endswith('.py')
         is_js: bool = server_path.endswith('.js')
         if not (is_python or is_js):
@@ -39,6 +40,13 @@ class Client:
         response = await self.session.list_tools() # gather tools to further get what the Agent needs from the API
         tools = response.tools
         print("\nConnected to server with tools:", [tool.name for tool in tools]) # display tools to user
+
+    async def connect_to_remote_server(self, url:str, headers:dict):
+        params = SseServerParameters(url=url, headers=headers)
+        sse_transport = await self.exit_stack.enter_async_context(sse_client(params))
+        read, write = await self.exit_stack.enter_async_context(sse_transport)
+        self.session = await self.exit_stack.enter_async_context(ClientSession(read, write))
+        await self.session.initialize()
 
 
     
