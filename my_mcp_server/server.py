@@ -51,7 +51,7 @@ class SolarWindow(BaseModel):
     start_date: str
     end_date: str
 
-def haversine_km(a: tuple, b: tuple) -> float:
+def _haversine_km(a: tuple, b: tuple) -> float:
     # a=(lat,lon), b=(lat,lon)
     R=6371.0
     dlat=math.radians(b[0]-a[0])
@@ -59,10 +59,11 @@ def haversine_km(a: tuple, b: tuple) -> float:
     s = (math.sin(dlat/2)**2 + math.cos(math.radians(a[0]))*math.cos(math.radians(b[0]))*math.sin(dlon/2)**2)
     return 2*R*math.asin(math.sqrt(s))
 
-
+# TODO implemented due to certain None errors, not sure if they're necessary
 def _safe_list(val):
     return val if isinstance(val, list) else []
 
+# TODO same here as in _safe_list
 def _safe_val(obj, key, default=None):
 
     if isinstance(obj, dict):
@@ -102,7 +103,7 @@ async def list_hazards(input: Hazards) -> dict:
             if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
                 continue
 
-            d = haversine_km((input.lat, input.lon), (lat, lon))
+            d = _haversine_km((input.lat, input.lon), (lat, lon))
             if ndist is None or d < ndist:
                 ndist, nearest = d, (lat, lon, _safe_val(g, "date", None))
 
@@ -129,6 +130,7 @@ async def list_hazards(input: Hazards) -> dict:
         params={"startDate": input.start_date, "endDate": input.end_date, "api_key": NASA_KEY}
     )
 
+    # in case it yields error
     if isinstance(donki, dict) and "error" in donki:
 
         events.append({
@@ -159,7 +161,7 @@ async def list_hazards(input: Hazards) -> dict:
 
 
 
-
+@mcp.tool()
 async def solar_weather(input: SolarWindow):
     """Rank dates by solar potential and low precip; exclude severe space weather."""
 
