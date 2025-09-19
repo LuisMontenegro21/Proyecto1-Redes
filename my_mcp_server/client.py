@@ -1,13 +1,13 @@
 #
 # Reference: https://modelcontextprotocol.io/quickstart/client 
 
-import asyncio
+import asyncio, os, traceback
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from mcp.client.sse import sse_client, SseServerParameters
-from anthropic import Anthropic
+from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 from dotenv import load_dotenv
 
 load_dotenv() # load environmental variables
@@ -17,7 +17,7 @@ class Client:
     def __init__(self) -> None:
         self.session: ClientSession | None = None
         self.exit_stack = AsyncExitStack()
-        self.anthropic = Anthropic()
+
 
 
     async def connect_to_local_server(self, server_path:str):
@@ -42,9 +42,8 @@ class Client:
         print("\nConnected to server with tools:", [tool.name for tool in tools]) # display tools to user
 
     async def connect_to_remote_server(self, url:str, headers:dict):
-        params = SseServerParameters(url=url, headers=headers)
-        sse_transport = await self.exit_stack.enter_async_context(sse_client(params))
-        read, write = await self.exit_stack.enter_async_context(sse_transport)
+
+        read, write, _ = await self.exit_stack.enter_async_context(streamablehttp_client(url=url, headers=headers))
         self.session = await self.exit_stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
 
@@ -127,11 +126,32 @@ class Client:
         await self.exit_stack.aclose()
 
 
+async def main():
+    mode: str = "remote"
+    client = Client()
+    try: 
+        if mode == "local":
+            server_path = "my_mcp_server/server.py" # path to local server script
+            await client.connect_to_local_server(server_path=server_path)
+        elif mode == "remote":
+            GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+            if not GITHUB_TOKEN:
+                raise ValueError("GITHUB_TOKEN not found in environment variables")
+            await client.connect_to_remote_server(
+                url="https://api.githubcopilot.com/mcp/",
+                headers={"Authorization" : f"Bearer {GITHUB_TOKEN}"})
+        tools = await client.session.list_tools()
+        print("Available tools:", [tool.name for tool in tools.tools])
+    except * Exception as eg:
+        for i, exc in enumerate(eg.exceptions, 1):
+            print(f"Excp: {i}: {type(exc).__name__} : {exc}")
+            traceback.print_exception(exc)  
+    finally:
+        await client.cleanup()
 
-def main():
-    pass
-
+def run() -> None:
+    asyncio.run(main())
 
 if __name__ == '__main__':
-    main()
+    run()
 

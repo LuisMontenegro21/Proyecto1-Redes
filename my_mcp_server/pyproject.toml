@@ -17,6 +17,6 @@ dependencies = [
 [tool.setuptools]
 py-modules = ["server", "client"]  
 
-[project.scripts]        # optional CLI entry point
+[project.scripts]      
 my-mcp-server = "server:main"
-my-mcp-client = "client:main"
+my-mcp-client = "client:run"
