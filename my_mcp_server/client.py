@@ -1,17 +1,55 @@
 # 19/09/2025
 # Reference: https://modelcontextprotocol.io/quickstart/client 
-from typing import Any, Callable
-import asyncio, os, traceback
+from typing import Any
+import asyncio, os, traceback, platform
 from contextlib import AsyncExitStack
 import re, json
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-# from mcp.client.sse import sse_client
+from openai import OpenAI
 from mcp.client.streamable_http import streamablehttp_client
 from dotenv import load_dotenv
 
-load_dotenv() # load environmental variables
+load_dotenv() # load environmental variables    
 
+# set agent config
+AGENT_SYSTEM = (
+"You can use tools via a single function mcp_call_tool.\n"
+    "When a tool is needed, call mcp_call_tool with:\n"
+    '{"tool_name":"<exact name>","arguments":{...}}\n'
+    "If a user request is actionable by a tool, you MUST call mcp_call_tool rather than answering in plain text.\n"
+    "If required inputs are missing, ask one clarifying question."
+)
+def prune_history(messages, max_chars=12000):
+    text = []
+    for m in messages[::-1]:  
+        s = m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content"), default=str)
+        if s is None: s = ""
+        if sum(len(t) for t in text) + len(s) > max_chars: break
+        text.append(m)
+    return list(reversed(text))
+
+def shorten(s: str, limit=4000):
+    return s if len(s) <= limit else s[:limit] + " …"
+
+def get_documents_root() -> str:
+    """
+    Return the path to the user's Documents directory in a cross-platform way.
+    Works on Windows, macOS, and Linux.
+    """
+    home = os.path.expanduser("~")
+
+    system = platform.system()
+    if system == "Windows":
+        docs = os.path.join(home, "Documents")
+    elif system == "Darwin":
+        docs = os.path.join(home, "Documents")
+    else:
+        docs = os.path.join(home, "Documents")
+    if os.path.isdir(docs):
+        return docs
+    else:
+        return home
 
 def _pp_content(items) -> str:
     chunks: list[str] = []
@@ -35,118 +73,156 @@ def _pp_content(items) -> str:
             chunks.append(repr(c))
     return "\n".join(chunks) if chunks else "(no content)"
 
-async def _list_tools(session: ClientSession) -> str:
-    tools_resp = await session.list_tools()
-    lines = []
-    for i, t in enumerate(tools_resp.tools):
-        desc = getattr(t, "description", "") or ""
-        lines.append(f"TOOL{i}: {t.name} : {desc}")
-    return "Available Tools\n" + "\n".join(lines)
 
-async def _tool_map(session: ClientSession) -> dict[str, Any]:
-    tools_resp = await session.list_tools()
-    return {t.name: t for t in tools_resp.tools}
 
-async def _show_schema(session: ClientSession, tool_name: str) -> str:
-    tools: dict[str, Any] = await _tool_map(session)
-    t = tools.get(tool_name, None)
-    if t is None:
-        return f"Tool {tool_name} was not found"
-    schema = getattr(t, "inputSchema", None) or getattr(t, "input_schema", None)
-    return json.dumps(schema, indent=2) if schema else "(no input schema)"
-
-async def _call_tool(session: ClientSession, tool_name: str, args: dict[str, Any]) -> str:
-    result = await session.call_tool(tool_name, args)
-    return _pp_content(result.content) 
-
-async def _tools_manifest(session:ClientSession) -> list[dict[str, Any]]:
-    resp = session.list_tools()
-    tools = []
-    for t in resp.tools:
-        tools.append({
+def _compact_manifest_items(tools_resp, include_schema: bool = True, max_chars: int = 12000) -> str:
+    """Build a compact JSON manifest for the prompt from list_tools() response."""
+    items = []
+    for t in tools_resp.tools:
+        obj = {
             "name": t.name,
-            "description": getattr(t, "description", "") or "",
-            "input_schema": getattr(t, "inputSchema", getattr(t, "input_schema", None))
+            "description": getattr(t, "description", "") or ""
+        }
+        if include_schema:
+            obj["input_schema"] = getattr(t, "inputSchema", getattr(t, "input_schema", None))
+        items.append(obj)
+    blob = json.dumps(items, indent=2)
+    return blob[:max_chars]
+
+async def small_chat(session: ClientSession, openai_client: OpenAI, user_prompt: str, model="gpt-4o-mini", max_steps=3):
+    # 1) Build tools manifest from MCP
+    tools_resp = await session.list_tools()
+    tools_manifest_json = _compact_manifest_items(tools_resp)
+
+    tools_spec = [{
+        "type": "function",
+        "function": {
+            "name": "mcp_call_tool",
+            "description": "Invoke an MCP tool by name with JSON arguments.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_name": {"type": "string"},
+                    "arguments": {"type": "object"},
+                },
+                "required": ["tool_name", "arguments"],
+                "additionalProperties": False
+            }
+        }
+    }]
+    messages = [
+        {"role": "system", "content": AGENT_SYSTEM + "\nAvailable tools:\n" + tools_manifest_json},
+        {"role": "user", "content": user_prompt}
+    ]
+    tool_result_text = None
+    for _ in range(max_steps):
+
+        resp = openai_client.chat.completions.create(
+            model=model,
+            messages=messages,
+            tools=tools_spec,
+            tool_choice="auto",
+            temperature=0,
+            max_tokens=400
+        )
+
+        msg = resp.choices[0].message
+        if not msg.tool_calls:
+            return msg.content or "(no content)"
+        
+        messages.append({
+            "role": "assistant",
+            "tool_calls": msg.tool_calls,
+            "content": msg.content or ""
         })
-    return tools
+
+
+        # A) Model wants to call a tool
+        for call in msg.tool_calls:
+
+            if call.function.name != "mcp_call_tool":
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": "Please use mcp_call_tool to invoke MCP tools."
+                })
+                continue
+
+            # Parse arguments
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except Exception as e:
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": f"(error) Invalid JSON in tool call: {e}"
+                })
+                continue
+
+            tool_name = args.get("tool_name")
+            arguments = args.get("arguments", {})
+
+
+            try:
+                mcp_result = await session.call_tool(tool_name, arguments)
+                tool_result_text = _pp_content(mcp_result)
+            except Exception as e:
+                tool_result_text = f"(error) {e}"
+
+
+
+            messages.append({
+                "role":"tool",
+                "tool_call_id":call.id,
+                "content": tool_result_text
+            })
+            continue
+
+        print("tool_calls:", [tc.function.name for tc in (msg.tool_calls or [])], "content:", repr(msg.content))
+        return msg.content or "(no content)"
+
+    return "Ran out of steps without an answer"
+
 
 class Client:
 
     def __init__(self) -> None:
         self.session: ClientSession | None = None
         self.exit_stack = AsyncExitStack()
-        self.llm_call: Callable[[str,str,str], str] | None = None
+        self.open_ai = OpenAI(api_key=os.getenv("OPEN_AI_KEY"))
 
-
-    async def connect_to_local_server(self, server_path:str):
-
-        command = "python"
-        server_params = StdioServerParameters(
-            command=command,
-            args=[server_path],
-            env=None
-        )
-        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-        self.stdio, self.write = stdio_transport
-        self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
+    #TODO verify it works
+    async def connect_to_local_server(self, server_path:str, root_path:str=None):
+        if root_path is None:
+            root_path = get_documents_root()
+        is_python:bool = server_path.endswith(".py")
+        is_js:bool = server_path.endswith(".js") 
+        if is_python:
+            directory: str= os.getcwd()
+            full_path: str = os.path.join(directory, ".venv\\Scripts\\my-mcp-server.exe")
+            server_params = StdioServerParameters(
+                command=full_path,
+                args=[],
+                env=None
+            )
+        if is_js:
+            server_params = StdioServerParameters(
+                command="npx",
+                args=["-y", "@modelcontextprotocol/server-filesystem", "--root", root_path]
+            )
+        
+        read,write = await self.exit_stack.enter_async_context(stdio_client(server_params))
+        self.session = await self.exit_stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
         
 
-    async def connect_to_remote_server(self, url:str, headers:dict, type:str="python"):
+    async def connect_to_remote_server(self, url:str, headers:dict):
 
         read, write, _ = await self.exit_stack.enter_async_context(streamablehttp_client(url=url, headers=headers))
         self.session = await self.exit_stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
-
-    def set_llm(self, llm_fn: Callable[[str, str, str], str]):
-        self.llm_call = llm_fn
-
-
-    async def process_query(self, query:str) -> str:
-        if query == ":tools":
-            return await _list_tools(self.session)
-        
-
-        m = re.match(r"^:schema\s+([A-Za-z0-9._:-]+)\s*$", query)
-        if m:
-            tool = m.group(1)
-            return await _show_schema(self.session, tool)
-        
-        m = re.match(r"^:call\s+([A-Za-z0-9._:-]+)\s*(\{.*\})?\s*$", query, re.DOTALL)
-        if m:
-            tool = m.group(1)
-            raw = m.group(2)
-            if raw:
-                try:
-                    args = json.loads(raw)
-                    if not isinstance(args, dict):
-                        return "Args must be a JSON object, e.g. :call tool {\"key\":\"val\"}"
-                except json.JSONDecodeError as e:
-                    return f"Invalid JSON: {e}"
-            else:
-                args = {}
-
-            tools = await _tool_map(self.session)
-            if tool not in tools:
-                # fuzzy suggestion
-                names = list(tools.keys())
-                hint = ", ".join(names[:10]) + (" …" if len(names) > 10 else "")
-                return f"Tool '{tool}' was not found. Try: {hint}"
-            try:
-                return await _call_tool(self.session, tool, args)
-            except Exception as e:
-                # Surface server-side validation nicely
-                return f"Tool error from '{tool}': {e}"
             
-        list_short = await _list_tools(self.session)
-        return (
-            "Commands:\n"
-            "  :tools\n"
-            "  :schema <tool>\n"
-            "  :call <tool> { JSON args }\n\n"
-            + list_short
-        )    
-                
 
     async def chat(self) -> None:
         '''
@@ -155,12 +231,10 @@ class Client:
         while True:
             try:
                 query = str(input("\nAsk something to chat: ").strip())
-                # exit command
-                if query.lower() == "exit":
+                if query == "exit":
                     break
-
-                response = await self.process_query(query=query)
-                print("\nAgent Response: " + response + "\n")
+                answer = await small_chat(self.session, self.open_ai, query)
+                print("\nAgent: " + answer)
 
             except KeyboardInterrupt:
                 print(f"Session ended by keyboard interruption")
@@ -176,9 +250,9 @@ class Client:
         await self.exit_stack.aclose()
 
 
+
 async def main(mode: str, server: str):
     client = Client()
-    servers: set[str] = {"Github", "NASA", "Cloud", "Filesystem"}
     try: 
         if mode == "local":
             if server == "NASA":
