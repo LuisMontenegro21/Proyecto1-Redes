@@ -18,8 +18,10 @@ AGENT_SYSTEM = (
     "When a tool is needed, call mcp_call_tool with:\n"
     '{"tool_name":"<exact name>","arguments":{...}}\n'
     "If a user request is actionable by a tool, you MUST call mcp_call_tool rather than answering in plain text.\n"
-    "If required inputs are missing, ask one clarifying question."
+    "If there are schema parameters missing for a tool call, reply what are the parameters and which ones are missing\n"
+    "You must use exact tool names from the manifest when calling mcp_call_tool."
 )
+#TODO implement
 def prune_history(messages, max_chars=12000):
     text = []
     for m in messages[::-1]:  
@@ -28,7 +30,7 @@ def prune_history(messages, max_chars=12000):
         if sum(len(t) for t in text) + len(s) > max_chars: break
         text.append(m)
     return list(reversed(text))
-
+#TODO implement
 def shorten(s: str, limit=4000):
     return s if len(s) <= limit else s[:limit] + " …"
 
@@ -50,6 +52,11 @@ def get_documents_root() -> str:
         return docs
     else:
         return home
+
+def _print_tool_use(tool_name: str, args: dict):
+    print("Tool name: ", tool_name)
+    for key, value in args.items():
+        print(f" - {key} : {value}\n")
 
 def _pp_content(items) -> str:
     chunks: list[str] = []
@@ -162,7 +169,8 @@ async def small_chat(session: ClientSession, openai_client: OpenAI, user_prompt:
 
             tool_name = args.get("tool_name")
             arguments = args.get("arguments", {})
-
+            _print_tool_use(tool_name, arguments)
+            
 
             try:
                 mcp_result = await session.call_tool(tool_name, arguments)
@@ -179,7 +187,7 @@ async def small_chat(session: ClientSession, openai_client: OpenAI, user_prompt:
             })
             continue
 
-        print("tool_calls:", [tc.function.name for tc in (msg.tool_calls or [])], "content:", repr(msg.content))
+        
         return msg.content or "(no content)"
 
     return "Ran out of steps without an answer"
