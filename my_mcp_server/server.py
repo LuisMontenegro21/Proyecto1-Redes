@@ -4,14 +4,13 @@ from typing import Any, Optional
 from mcp.server.fastmcp import FastMCP
 import json
 import sys
-import asyncio
 import logging
 import math
 from pydantic import BaseModel
 
 
 
-SATELLITE_API = "https://tle.ivanstanojevic.me/api"
+
 EONET_API = "https://eonet.gsfc.nasa.gov/api/v3/events"
 DONKI_API = "https://api.nasa.gov/DONKI/alerts"
 SOLAR_API = "https://power.larc.nasa.gov/api/temporal/daily/point"
@@ -32,9 +31,6 @@ DEFAULT_HEADERS = {
     "Connection": "close",
 }
 
-class Satellite(BaseModel):
-    id: str
-    name: str
 
 
 class Hazards(BaseModel):
@@ -210,36 +206,6 @@ async def solar_weather(input: SolarWindow):
 
 
 
-@mcp.tool()
-async def search_satellites(input: Satellite) -> dict:    
-    '''
-    Searches information from a satellite
-    '''
-    url = f"{SATELLITE_API}/tle/"  
-
-    data = await make_request(url=url, params={"search": input.name})
-    if not isinstance(data, dict):
-        return {}
-    
-    members = data.get("member", [])
-    if not members:
-        return f"No members found"
-    
-    data = await asyncio.gather(*[format_information(m) for m in members])
-    return data
-
-@mcp.tool()
-async def search_satellite_by_id(input: Satellite) -> dict:
-    '''
-    Gets information from a satellite using the ID
-    '''
-    url = f"{SATELLITE_API}/tle/{input.id}"
-    data = await make_request(url=url)
-    if  not isinstance(data, dict):
-        return {}
-    data = await asyncio.gather(format_information(data))
-    logging.info("Using tool search_satellite_by_id")
-    return data
 
 async def make_request(url: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any] | None:
     '''
@@ -275,24 +241,7 @@ async def make_request(url: str, params: Optional[dict[str, Any]] = None) -> dic
             logging.error("Unexpected error for %s: %r", url, e)
             return None
 
-        
-async def format_information(member: dict) -> list[str]:
-    """
-    Format TLE in a nice way
-    """
-    sat_id = member.get("satelliteId", "0")
-    name = member.get("name", "Unknown")
-    date = member.get("date", "n/a")
-    line1 = member.get("line1", "Unknown")
-    line2 = member.get("line2", "Unknown")
-
-    return (
-        f"satelliteId: {sat_id}\n"
-        f"name       : {name}\n"
-        f"date       : {date}\n"
-        f"line1      : {line1}\n"
-        f"line2      : {line2}"
-    )
+    
 
 
 def main():
