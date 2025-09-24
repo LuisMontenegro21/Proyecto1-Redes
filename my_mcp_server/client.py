@@ -3,8 +3,7 @@
 from typing import Any
 import asyncio, os, traceback, platform
 from contextlib import AsyncExitStack
-import re, json
-from mcp.types import InitializeRequestParams
+import json
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from openai import OpenAI
@@ -22,18 +21,7 @@ AGENT_SYSTEM = (
     "If there are schema parameters missing for a tool call, reply what are the parameters and which ones are missing\n"
     "You must use exact tool names from the manifest when calling mcp_call_tool."
 )
-#TODO implement
-def prune_history(messages, max_chars=12000):
-    text = []
-    for m in messages[::-1]:  
-        s = m.get("content") if isinstance(m.get("content"), str) else json.dumps(m.get("content"), default=str)
-        if s is None: s = ""
-        if sum(len(t) for t in text) + len(s) > max_chars: break
-        text.append(m)
-    return list(reversed(text))
-#TODO implement
-def shorten(s: str, limit=4000):
-    return s if len(s) <= limit else s[:limit] + " …"
+
 
 def get_documents_root() -> str:
     """
@@ -97,10 +85,17 @@ def _compact_manifest_items(tools_resp, include_schema: bool = True, max_chars: 
     blob = json.dumps(items, indent=2)
     return blob[:max_chars]
 
-async def small_chat(session: ClientSession, openai_client: OpenAI, user_prompt: str, model="gpt-4o-mini", max_steps=3):
-    # 1) Build tools manifest from MCP
+
+
+async def small_chat(
+    session: ClientSession,
+    openai_client: OpenAI,
+    user_prompt: str,
+    model: str = "gpt-4o-mini",
+    max_steps: int = 4,
+) -> str:
     tools_resp = await session.list_tools()
-    tools_manifest_json = _compact_manifest_items(tools_resp)
+    tools_manifest = _compact_manifest_items(tools_resp)
 
     tools_spec = [{
         "type": "function",
@@ -118,38 +113,56 @@ async def small_chat(session: ClientSession, openai_client: OpenAI, user_prompt:
             }
         }
     }]
-    messages = [
-        {"role": "system", "content": AGENT_SYSTEM + "\nAvailable tools:\n" + tools_manifest_json},
-        {"role": "user", "content": user_prompt}
-    ]
-    tool_result_text = None
-    for _ in range(max_steps):
 
+    messages = [
+        {"role": "system", "content": AGENT_SYSTEM + "\nAvailable tools:\n" + tools_manifest},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    last_tool_text: str | None = None
+
+    for step in range(max_steps):
         resp = openai_client.chat.completions.create(
             model=model,
             messages=messages,
             tools=tools_spec,
             tool_choice="auto",
             temperature=0,
-            max_tokens=400
+            max_tokens=700,
         )
-
         msg = resp.choices[0].message
-        if not msg.tool_calls:
-            return msg.content or "(no content)"
-        
+
+        # 1) If the model is done (no tool_calls) -> return content or fallbacks
+        if not getattr(msg, "tool_calls", None):
+            content = (msg.content or "").strip()
+            if content:
+                return content
+
+            # Defensive fallback: if content is empty, try to nudge once
+            if last_tool_text and step + 1 < max_steps:
+                messages.append({
+                    "role": "assistant",
+                    "content": "(acknowledged tool results; synthesizing answer)"
+                })
+                messages.append({
+                    "role": "user",
+                    "content": "Using the tool results above, answer plainly. If there were no results, say so explicitly."
+                })
+                continue
+
+            # Final fallback
+            return last_tool_text or "(no content)"
+
+        # 2) Append the assistant tool-call “shell” message
         messages.append({
             "role": "assistant",
             "tool_calls": msg.tool_calls,
             "content": msg.content or ""
         })
 
-
-        # A) Model wants to call a tool
+        # 3) Execute each tool call
         for call in msg.tool_calls:
-
             if call.function.name != "mcp_call_tool":
-
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.id,
@@ -157,9 +170,11 @@ async def small_chat(session: ClientSession, openai_client: OpenAI, user_prompt:
                 })
                 continue
 
-            # Parse arguments
+            # Parse args safely
             try:
                 args = json.loads(call.function.arguments or "{}")
+                tool_name = args["tool_name"]
+                arguments = args.get("arguments", {})
             except Exception as e:
                 messages.append({
                     "role": "tool",
@@ -168,31 +183,24 @@ async def small_chat(session: ClientSession, openai_client: OpenAI, user_prompt:
                 })
                 continue
 
-            tool_name = args.get("tool_name")
-            arguments = args.get("arguments", {})
-            _print_tool_use(tool_name, arguments)
-            
-
+            # Call the MCP tool
             try:
                 mcp_result = await session.call_tool(tool_name, arguments)
-                tool_result_text = _pp_content(mcp_result)
+                tool_text = _pp_content(mcp_result)
             except Exception as e:
-                tool_result_text = f"(error) {e}"
+                tool_text = f"(error) {e}"
 
-
-
+            last_tool_text = tool_text
             messages.append({
-                "role":"tool",
-                "tool_call_id":call.id,
-                "content": tool_result_text
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": tool_text
             })
-            continue
 
-        
-        return msg.content or "(no content)"
+        # 🔁 loop again so the model can read the tool outputs and answer
+        continue
 
-    return "Ran out of steps without an answer"
-
+    return last_tool_text or "Ran out of steps without an answer"
 
 class Client:
 
@@ -202,12 +210,11 @@ class Client:
         self.open_ai = OpenAI(api_key=os.getenv("OPEN_AI_KEY"))
 
     #TODO verify it works
-    async def connect_to_local_server(self, server_path:str, root_path:str=None):
+    async def connect_to_local_server(self, root_path:str=None, personal_server: bool= True):
         if root_path is None:
             root_path = get_documents_root()
-        is_python:bool = server_path.endswith(".py")
-        is_js:bool = server_path.endswith(".js") 
-        if is_python:
+        
+        if personal_server:
             directory: str= os.getcwd()
             full_path: str = os.path.join(directory, ".venv\\Scripts\\my-mcp-server.exe")
             server_params = StdioServerParameters(
@@ -215,10 +222,10 @@ class Client:
                 args=[],
                 env=None
             )
-        if is_js:
+        else:
             server_params = StdioServerParameters(
                 command="npx",
-                args=["-y", "@modelcontextprotocol/server-filesystem", "--root", root_path]
+                args=["-y", "@modelcontextprotocol/server-filesystem", root_path],
             )
         
         read,write = await self.exit_stack.enter_async_context(stdio_client(server_params))
@@ -265,10 +272,11 @@ async def main(mode: str, server: str):
     try: 
         if mode == "local":
             if server == "NASA":
-                server_path = "my_mcp_server/server.py" # path to local server script
-                await client.connect_to_local_server(server_path=server_path)
+                await client.connect_to_local_server()
+                await client.chat()
             elif server == "Filesystem":
-                server_path = ""
+                await client.connect_to_local_server(personal_server=False)
+                await client.chat()
             
         elif mode == "remote":
 
