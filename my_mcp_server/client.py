@@ -4,6 +4,7 @@ from typing import Any
 import asyncio, os, traceback, platform
 from contextlib import AsyncExitStack
 import re, json
+from mcp.types import InitializeRequestParams
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from openai import OpenAI
@@ -225,9 +226,9 @@ class Client:
         await self.session.initialize()
         
 
-    async def connect_to_remote_server(self, url:str, headers:dict):
+    async def connect_to_remote_server(self, url:str, headers:dict|None=None):
 
-        read, write, _ = await self.exit_stack.enter_async_context(streamablehttp_client(url=url, headers=headers))
+        read, write, _ = await self.exit_stack.enter_async_context(streamablehttp_client(url=url, headers=headers or {}))
         self.session = await self.exit_stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
             
@@ -281,9 +282,11 @@ async def main(mode: str, server: str):
                 await client.chat()
                 
             elif server == "Cloud":
-                TOKEN = os.getenv("ANTHROPIC_API_KEY")
-                if not TOKEN:
-                    raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
+                await client.connect_to_remote_server(
+                    url="http://18.188.123.189:5000/mcp",
+                    headers={}
+                )
+                await client.chat()
 
 
             
