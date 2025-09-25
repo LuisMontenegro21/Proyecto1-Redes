@@ -1,6 +1,5 @@
 # 19/09/2025
 # Reference: https://modelcontextprotocol.io/quickstart/client 
-from typing import Any
 import asyncio, os, traceback, platform
 from contextlib import AsyncExitStack
 import json
@@ -9,6 +8,9 @@ from mcp.client.stdio import stdio_client
 from openai import OpenAI
 from mcp.client.streamable_http import streamablehttp_client
 from dotenv import load_dotenv
+from pathlib import Path
+from types import SimpleNamespace
+
 
 load_dotenv() # load environmental variables    
 
@@ -21,6 +23,35 @@ AGENT_SYSTEM = (
     "If there are schema parameters missing for a tool call, reply what are the parameters and which ones are missing\n"
     "You must use exact tool names from the manifest when calling mcp_call_tool."
 )
+
+def save_history_jsonl(history: list[dict], path: str):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("w", encoding="utf-8") as f:
+        for m in history:
+            f.write(json.dumps(m, ensure_ascii=False) + "\n")
+
+def load_history_jsonl(path: str) -> list[dict]:
+    p = Path(path)
+    if not p.exists():
+        return []
+    msgs = []
+    with p.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                msgs.append(json.loads(line))
+    return msgs
+
+def _append_history(history: list[dict], new_msgs: list[dict], keep_last:int=50) -> list[dict]:
+    """Append and keep only the most recent N messages."""
+    history.extend(new_msgs)
+    if keep_last and len(history) > keep_last:
+        # keep the system message if you have one at index 0
+        sys = history[:1] if history and history[0].get("role") == "system" else []
+        tail = history[-keep_last:]
+        history[:] = (sys + tail) if sys else tail
+    return history
 
 
 def get_documents_root() -> str:
@@ -42,10 +73,6 @@ def get_documents_root() -> str:
     else:
         return home
 
-def _print_tool_use(tool_name: str, args: dict):
-    print("Tool name: ", tool_name)
-    for key, value in args.items():
-        print(f" - {key} : {value}\n")
 
 def _pp_content(items) -> str:
     chunks: list[str] = []
@@ -58,9 +85,6 @@ def _pp_content(items) -> str:
                 chunks.append(json.dumps(c.data, indent=2))
             except Exception:
                 chunks.append(str(c.data))
-        elif t == "image":
-            url = getattr(c, "uri", None) or getattr(c, "url", None)
-            chunks.append(f"[image] {url or '(binary)'}")
         elif t == "resource":
             rid = getattr(c, "id", None)
             uri = getattr(c, "uri", None)
@@ -85,17 +109,22 @@ def _compact_manifest_items(tools_resp, include_schema: bool = True, max_chars: 
     blob = json.dumps(items, indent=2)
     return blob[:max_chars]
 
-
-
 async def small_chat(
     session: ClientSession,
     openai_client: OpenAI,
     user_prompt: str,
     model: str = "gpt-4o-mini",
     max_steps: int = 4,
-) -> str:
+    history: list[dict] | None = None,
+    keep_last: int = 50
+) -> tuple[str, list[dict]]:
     tools_resp = await session.list_tools()
     tools_manifest = _compact_manifest_items(tools_resp)
+
+    system_msg = {"role" : "system", "content": AGENT_SYSTEM + "\nAvailable Tools:\n" + tools_manifest}
+    history = list(history or [])
+    if not history or history[0].get("role") != "system":
+        history.insert(0, system_msg)
 
     tools_spec = [{
         "type": "function",
@@ -114,14 +143,15 @@ async def small_chat(
         }
     }]
 
-    messages = [
-        {"role": "system", "content": AGENT_SYSTEM + "\nAvailable tools:\n" + tools_manifest},
+    turn_msgs = [
+        # {"role": "system", "content": AGENT_SYSTEM + "\nAvailable tools:\n" + tools_manifest},
         {"role": "user", "content": user_prompt},
     ]
+    messages = history + turn_msgs
 
     last_tool_text: str | None = None
 
-    for step in range(max_steps):
+    for _ in range(max_steps):
         resp = openai_client.chat.completions.create(
             model=model,
             messages=messages,
@@ -135,30 +165,20 @@ async def small_chat(
         # 1) If the model is done (no tool_calls) -> return content or fallbacks
         if not getattr(msg, "tool_calls", None):
             content = (msg.content or "").strip()
-            if content:
-                return content
 
-            # Defensive fallback: if content is empty, try to nudge once
-            if last_tool_text and step + 1 < max_steps:
-                messages.append({
-                    "role": "assistant",
-                    "content": "(acknowledged tool results; synthesizing answer)"
-                })
-                messages.append({
-                    "role": "user",
-                    "content": "Using the tool results above, answer plainly. If there were no results, say so explicitly."
-                })
-                continue
+            turn_msgs.append({"role": "assistant", "content": content})
 
+            updated = _append_history(history, turn_msgs, keep_last=keep_last)
             # Final fallback
-            return last_tool_text or "(no content)"
+            return (content or (last_tool_text or "(no content)")), updated
 
-        # 2) Append the assistant tool-call “shell” message
-        messages.append({
+        shell = {
             "role": "assistant",
             "tool_calls": msg.tool_calls,
             "content": msg.content or ""
-        })
+        }
+        turn_msgs.append(shell)
+        messages.append(shell)
 
         # 3) Execute each tool call
         for call in msg.tool_calls:
@@ -176,40 +196,86 @@ async def small_chat(
                 tool_name = args["tool_name"]
                 arguments = args.get("arguments", {})
             except Exception as e:
-                messages.append({
+                reply = {
                     "role": "tool",
                     "tool_call_id": call.id,
                     "content": f"(error) Invalid JSON in tool call: {e}"
-                })
+                }
+                turn_msgs.append(reply)
+                messages.append(reply)
                 continue
 
             # Call the MCP tool
             try:
                 mcp_result = await session.call_tool(tool_name, arguments)
-                tool_text = _pp_content(mcp_result)
+                tool_text = _pp_content(mcp_result) or "(empty result)"
             except Exception as e:
                 tool_text = f"(error) {e}"
 
             last_tool_text = tool_text
-            messages.append({
+            tool_reply = {
                 "role": "tool",
                 "tool_call_id": call.id,
                 "content": tool_text
-            })
+            }
+            turn_msgs.append(tool_reply)
+            messages.append(tool_reply)
 
-        # 🔁 loop again so the model can read the tool outputs and answer
         continue
+    updated = _append_history(history, turn_msgs, keep_last=keep_last)
+    return (last_tool_text or "Ran out of steps without an answer"), updated
 
-    return last_tool_text or "Ran out of steps without an answer"
 
 class Client:
-
+    __slots__ = ('session', 'exit_stack', 'open_ai', '_sessions', '_tool_index')
     def __init__(self) -> None:
-        self.session: ClientSession | None = None
+        #self.session: ClientSession | None = None
+        self.session = None
         self.exit_stack = AsyncExitStack()
         self.open_ai = OpenAI(api_key=os.getenv("OPEN_AI_KEY"))
 
-    #TODO verify it works
+        self._sessions : dict[str, ClientSession] = {}
+        self._tool_index : dict[str, tuple[str,str]] = {}
+
+    async def _index(self, prefix: str, sess: ClientSession):
+        if prefix in self._sessions:
+            raise ValueError(f"prefix '{prefix}' already registered")
+        self._sessions[prefix] = sess
+        tools = (await sess.list_tools()).tools or []
+        for t in tools:
+            self._tool_index[f"{prefix}.{t.name}"] = (prefix, t.name)
+        self.session = self
+        
+    async def register_http(self, prefix: str, url: str, headers:dict|None={}):
+        read, write, _ = await self.exit_stack.enter_async_context(streamablehttp_client(url=url, headers=headers))
+        session = await self.exit_stack.enter_async_context(ClientSession(read, write))
+        await session.initialize()
+        await self._index(prefix, session)
+    
+    async def register_stdio(self, prefix: str, params: StdioServerParameters):
+        read, write = await self.exit_stack.enter_async_context(stdio_client(params))
+        sess = await self.exit_stack.enter_async_context(ClientSession(read, write))
+        await sess.initialize()
+        await self._index(prefix, sess)
+
+    # redirect tool listing correctly depending of the server
+    async def list_tools(self):
+        
+        return SimpleNamespace(
+            tools=[
+                SimpleNamespace(
+                    name=name,
+                    description=f"From '{name.split('.', 1)[0]}' server"
+                )
+                for name in sorted(self._tool_index.keys())
+            ]
+        )
+    # redirect tool calls depending of the server
+    async def call_tool(self, tool_name: str, arguments: dict):
+        prefix, plain = self._tool_index[tool_name]
+        return await self._sessions[prefix].call_tool(plain, arguments)
+
+
     async def connect_to_local_server(self, root_path:str=None, personal_server: bool= True):
         if root_path is None:
             root_path = get_documents_root()
@@ -234,7 +300,6 @@ class Client:
         
 
     async def connect_to_remote_server(self, url:str, headers:dict|None=None):
-
         read, write, _ = await self.exit_stack.enter_async_context(streamablehttp_client(url=url, headers=headers or {}))
         self.session = await self.exit_stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
@@ -244,14 +309,15 @@ class Client:
         '''
         Provides chat interface to generate questions and responses
         '''
+        history: list[dict] = []
         while True:
             try:
                 query = str(input("\nAsk something to chat: ").strip())
                 if query == "exit":
                     break
-                answer = await small_chat(self.session, self.open_ai, query)
+                answer, history = await small_chat(self.session, self.open_ai, query, history=history)
                 print("\nAgent: " + answer)
-
+                save_history_jsonl(history=history, path="chat_logs/log.jsonl")
             except KeyboardInterrupt:
                 print(f"Session ended by keyboard interruption")
                 break
@@ -260,44 +326,23 @@ class Client:
                 print(f"\nError: {exc}")
                 break
                 
-
-
     async def cleanup(self) -> None:
         await self.exit_stack.aclose()
 
 
 
-async def main(mode: str, server: str):
+
+async def main():
     client = Client()
     try: 
-        if mode == "local":
-            if server == "NASA":
-                await client.connect_to_local_server()
-                await client.chat()
-            elif server == "Filesystem":
-                await client.connect_to_local_server(personal_server=False)
-                await client.chat()
-            
-        elif mode == "remote":
-
-            if server == "Github":
-                TOKEN = os.getenv("GITHUB_TOKEN")
-                if not TOKEN:
-                    raise ValueError("Github  not found in environment variables")
-                await client.connect_to_remote_server(
-                    url="https://api.githubcopilot.com/mcp/",
-                    headers={"Authorization" : f"Bearer {TOKEN}"})
-                await client.chat()
-                
-            elif server == "Cloud":
-                await client.connect_to_remote_server(
-                    url="http://18.188.123.189:5000/mcp",
-                    headers={}
+        fs_params = StdioServerParameters(
+                    command="npx",
+                    args=["-y", "@modelcontextprotocol/server-filesystem", "."],
                 )
-                await client.chat()
-
-
-            
+        await client.register_stdio("fs", fs_params)
+        GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+        await client.register_http(prefix = "gh",url="https://api.githubcopilot.com/mcp/", headers={"Authorization" : f"Bearer {GITHUB_TOKEN}"})
+        await client.chat()
     except * Exception as eg:
         for i, exc in enumerate(eg.exceptions, 1):
             print(f"Excp: {i}: {type(exc).__name__} : {exc}")
@@ -305,27 +350,61 @@ async def main(mode: str, server: str):
     finally:
         await client.cleanup()
 
+    # try: 
+    #     if mode == "local":
+    #         if server == "NASA":
+    #             await client.connect_to_local_server()
+    #             await client.chat()
+    #         elif server == "Filesystem":
+    #             await client.connect_to_local_server(personal_server=False)
+    #             await client.chat()
+            
+    #     elif mode == "remote":
+
+    #         if server == "Github":
+    #             TOKEN = os.getenv("GITHUB_TOKEN")
+    #             if not TOKEN:
+    #                 raise ValueError("Github  not found in environment variables")
+    #             await client.connect_to_remote_server(
+    #                 url="https://api.githubcopilot.com/mcp/",
+    #                 headers={"Authorization" : f"Bearer {TOKEN}"})
+    #             await client.chat()
+    #         #TODO needs fixing :/
+    #         elif server == "Cloud":
+    #             await client.connect_to_remote_server(
+    #                 url="http://18.188.123.189:5000/mcp",
+    #                 headers={}
+    #             )
+    #             await client.chat()
+      
+    # except * Exception as eg:
+    #     for i, exc in enumerate(eg.exceptions, 1):
+    #         print(f"Excp: {i}: {type(exc).__name__} : {exc}")
+    #         traceback.print_exception(exc)  
+    # finally:
+    #     await client.cleanup()
+
 def run() -> None:
     print("### Client ###")
-    remotes: str = "Github\nCloud\n"
-    locals: str = "Filesystem\nNASA\n"
-    mode: str = str(input("Enter mode (remote | local): "))
+    # remotes: str = "Github\nCloud\n"
+    # locals: str = "Filesystem\nNASA\n"
+    # mode: str = str(input("Enter mode (remote | local): "))
     
-    select_server: str 
-    while True:
+    # select_server: str 
+    # while True:
         
-        if mode == "remote":
-            print(remotes)
-        elif mode == "local":
-            print(locals)
+    #     if mode == "remote":
+    #         print(remotes)
+    #     elif mode == "local":
+    #         print(locals)
             
-        select_server = str(input("Select server to connect to: "))
-        if select_server in {"Github", "Cloud", "Filesystem", "NASA"}:
-            break
-        else:
-            print("Not a valid server")
-            pass
-    asyncio.run(main(mode=mode, server=select_server))
+    #     select_server = str(input("Select server to connect to: "))
+    #     if select_server in {"Github", "Cloud", "Filesystem", "NASA"}:
+    #         break
+    #     else:
+    #         print("Not a valid server")
+    #         pass
+    asyncio.run(main())
 
 if __name__ == '__main__':
     run()
