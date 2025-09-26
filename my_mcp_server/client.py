@@ -72,6 +72,20 @@ def get_documents_root() -> str:
         return docs
     else:
         return home
+    
+def _serialize_tool_calls(tool_calls):
+    out = []
+    for tc in (tool_calls or []):
+        # tc has .id, .type, and .function with .name and .arguments (JSON string)
+        out.append({
+            "id": tc.id,
+            "type": tc.type,  # usually "function"
+            "function": {
+                "name": tc.function.name,
+                "arguments": tc.function.arguments,  # already a JSON string per API
+            }
+        })
+    return out
 
 
 def _pp_content(items) -> str:
@@ -174,7 +188,7 @@ async def small_chat(
 
         shell = {
             "role": "assistant",
-            "tool_calls": msg.tool_calls,
+            "tool_calls": _serialize_tool_calls(msg.tool_calls),
             "content": msg.content or ""
         }
         turn_msgs.append(shell)
@@ -190,7 +204,6 @@ async def small_chat(
                 })
                 continue
 
-            # Parse args safely
             try:
                 args = json.loads(call.function.arguments or "{}")
                 tool_name = args["tool_name"]
@@ -283,16 +296,9 @@ class Client:
         if personal_server:
             directory: str= os.getcwd()
             full_path: str = os.path.join(directory, ".venv\\Scripts\\my-mcp-server.exe")
-            server_params = StdioServerParameters(
-                command=full_path,
-                args=[],
-                env=None
-            )
+            server_params = StdioServerParameters(command=full_path,args=[],env=None)
         else:
-            server_params = StdioServerParameters(
-                command="npx",
-                args=["-y", "@modelcontextprotocol/server-filesystem", root_path],
-            )
+            server_params = StdioServerParameters(command="npx",args=["-y", "@modelcontextprotocol/server-filesystem", root_path])
         
         read,write = await self.exit_stack.enter_async_context(stdio_client(server_params))
         self.session = await self.exit_stack.enter_async_context(ClientSession(read, write))
@@ -303,6 +309,8 @@ class Client:
         read, write, _ = await self.exit_stack.enter_async_context(streamablehttp_client(url=url, headers=headers or {}))
         self.session = await self.exit_stack.enter_async_context(ClientSession(read, write))
         await self.session.initialize()
+    
+
             
 
     async def chat(self) -> None:
@@ -332,16 +340,28 @@ class Client:
 
 
 
-async def main():
+async def main(server_indication:str="filesystem"):
     client = Client()
     try: 
+        directory: str= os.getcwd()
         fs_params = StdioServerParameters(
                     command="npx",
-                    args=["-y", "@modelcontextprotocol/server-filesystem", "."],
+                    args=["-y", "@modelcontextprotocol/server-filesystem", directory],
                 )
-        await client.register_stdio("fs", fs_params)
+        
+        full_path: str = os.path.join(directory, ".venv\\Scripts\\my-mcp-server.exe")
+        server_params = StdioServerParameters(
+                command=full_path,
+                args=[],
+                env=None
+            )
         GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-        await client.register_http(prefix = "gh",url="https://api.githubcopilot.com/mcp/", headers={"Authorization" : f"Bearer {GITHUB_TOKEN}"})
+        if server_indication == "filesystem":
+            await client.register_stdio("fs", fs_params)
+            await client.register_http(prefix = "gh",url="https://api.githubcopilot.com/mcp/", headers={"Authorization" : f"Bearer {GITHUB_TOKEN}"})
+        else:
+            await client.connect_to_local_server(personal_server=True)
+        # await client.register_http(prefix="cloud", url = "http://18.191.243.65:8000/mcp", headers={})
         await client.chat()
     except * Exception as eg:
         for i, exc in enumerate(eg.exceptions, 1):
@@ -350,61 +370,11 @@ async def main():
     finally:
         await client.cleanup()
 
-    # try: 
-    #     if mode == "local":
-    #         if server == "NASA":
-    #             await client.connect_to_local_server()
-    #             await client.chat()
-    #         elif server == "Filesystem":
-    #             await client.connect_to_local_server(personal_server=False)
-    #             await client.chat()
-            
-    #     elif mode == "remote":
-
-    #         if server == "Github":
-    #             TOKEN = os.getenv("GITHUB_TOKEN")
-    #             if not TOKEN:
-    #                 raise ValueError("Github  not found in environment variables")
-    #             await client.connect_to_remote_server(
-    #                 url="https://api.githubcopilot.com/mcp/",
-    #                 headers={"Authorization" : f"Bearer {TOKEN}"})
-    #             await client.chat()
-    #         #TODO needs fixing :/
-    #         elif server == "Cloud":
-    #             await client.connect_to_remote_server(
-    #                 url="http://18.188.123.189:5000/mcp",
-    #                 headers={}
-    #             )
-    #             await client.chat()
-      
-    # except * Exception as eg:
-    #     for i, exc in enumerate(eg.exceptions, 1):
-    #         print(f"Excp: {i}: {type(exc).__name__} : {exc}")
-    #         traceback.print_exception(exc)  
-    # finally:
-    #     await client.cleanup()
-
 def run() -> None:
     print("### Client ###")
-    # remotes: str = "Github\nCloud\n"
-    # locals: str = "Filesystem\nNASA\n"
-    # mode: str = str(input("Enter mode (remote | local): "))
-    
-    # select_server: str 
-    # while True:
-        
-    #     if mode == "remote":
-    #         print(remotes)
-    #     elif mode == "local":
-    #         print(locals)
-            
-    #     select_server = str(input("Select server to connect to: "))
-    #     if select_server in {"Github", "Cloud", "Filesystem", "NASA"}:
-    #         break
-    #     else:
-    #         print("Not a valid server")
-    #         pass
-    asyncio.run(main())
+    print("Local & Remote | Filesystem & Github")
+    indication: str = str(input("Enter mode: "))
+    asyncio.run(main(server_indication=indication))
 
 if __name__ == '__main__':
     run()
